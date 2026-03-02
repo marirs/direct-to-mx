@@ -1,0 +1,30 @@
+[package]
+name = "direct_to_mx"
+version = "0.1.0"
+edition = "2024"
+authors = ["Sriram G <marirs@gmail.com>"]
+license = "MIT"
+description = "Direct-to-MX email delivery with DKIM signing, IPv4 forcing, MX fallback, bulk sending, attachments, DKIM key generation, and DNS verification"
+repository = "https://github.com/marirs/direct-to-mx"
+homepage = "https://github.com/marirs/direct-to-mx"
+documentation = "https://docs.rs/direct_to_mx"
+readme = "README.md"
+keywords = ["email", "smtp", "dkim", "mx", "deliverability"]
+categories = ["email", "network-programming"]
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+base64 = "0.22"
+chrono = "0.4"
+hex = "0.4"
+hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "dkim"] }
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
