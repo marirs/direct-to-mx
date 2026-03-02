@@ -644,7 +644,6 @@ fn sign_dkim_cached(email: &mut lettre::Message, dkim: &CachedDkim) {
             HeaderName::new_from_ascii_str("Date"),
             HeaderName::new_from_ascii_str("Message-ID"),
             HeaderName::new_from_ascii_str("Content-Type"),
-            HeaderName::new_from_ascii_str("Content-Transfer-Encoding"),
         ],
         DkimCanonicalization {
             header: DkimCanonicalizationType::Relaxed,
