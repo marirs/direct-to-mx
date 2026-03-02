@@ -612,8 +612,6 @@ fn mime_from_extension(path: &std::path::Path) -> &'static str {
 }
 
 /// DKIM sign using the pre-parsed (cached) signing key.
-/// Uses N+1 oversigning on `From` to prevent header injection attacks
-/// (RFC 6376 §5.4).
 fn sign_dkim_cached(email: &mut lettre::Message, dkim: &CachedDkim) {
     use lettre::message::dkim::{
         DkimCanonicalization, DkimCanonicalizationType, DkimConfig, DkimSigningAlgorithm,
@@ -635,9 +633,6 @@ fn sign_dkim_cached(email: &mut lettre::Message, dkim: &CachedDkim) {
         dkim.domain.clone(),
         signing_key,
         vec![
-            // N+1 oversigning: sign From twice to prevent injection of a
-            // second From header (RFC 6376 §5.4 recommendation).
-            HeaderName::new_from_ascii_str("From"),
             HeaderName::new_from_ascii_str("From"),
             HeaderName::new_from_ascii_str("To"),
             HeaderName::new_from_ascii_str("Subject"),
