@@ -1,4 +1,4 @@
-# direct_to_mx
+# Direct-to-MX
 
 [![CI](https://github.com/marirs/direct-to-mx/actions/workflows/ci.yml/badge.svg)](https://github.com/marirs/direct-to-mx/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/direct_to_mx.svg)](https://crates.io/crates/direct_to_mx)
