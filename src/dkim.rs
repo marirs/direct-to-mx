@@ -47,10 +47,14 @@ pub fn generate_dkim_keypair(
 
     let bits = bits.unwrap_or(2048);
     if selector.is_empty() {
-        return Err(DirectToMxError::Config("DKIM selector must not be empty".into()));
+        return Err(DirectToMxError::Config(
+            "DKIM selector must not be empty".into(),
+        ));
     }
     if domain.is_empty() {
-        return Err(DirectToMxError::Config("DKIM domain must not be empty".into()));
+        return Err(DirectToMxError::Config(
+            "DKIM domain must not be empty".into(),
+        ));
     }
 
     let mut rng = rsa::rand_core::OsRng;

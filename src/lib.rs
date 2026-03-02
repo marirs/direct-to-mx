@@ -35,12 +35,12 @@ pub mod dns;
 pub mod error;
 mod send;
 
-pub use dkim::{generate_dkim_keypair, DkimKeyPair};
+pub use dkim::{DkimKeyPair, generate_dkim_keypair};
 pub use dns::{
-    verify_dns, DnsCheck, DnsCheckResult, DnsCheckStatus, DnsVerifyOptions, DnsVerifyReport,
+    DnsCheck, DnsCheckResult, DnsCheckStatus, DnsVerifyOptions, DnsVerifyReport, verify_dns,
 };
 pub use error::DirectToMxError;
 pub use send::{
-    Attachment, Body, BulkResult, DkimOptions, DirectToMx, DirectToMxBuilder, OutboundMessage,
-    DEFAULT_CONCURRENCY,
+    Attachment, Body, BulkResult, DEFAULT_CONCURRENCY, DirectToMx, DirectToMxBuilder, DkimOptions,
+    OutboundMessage,
 };

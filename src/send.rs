@@ -230,11 +230,8 @@ impl DirectToMxBuilder {
         let cached_dkim = match self.dkim {
             Some(opts) => {
                 use lettre::message::dkim::{DkimSigningAlgorithm, DkimSigningKey};
-                let _ =
-                    DkimSigningKey::new(&opts.private_key_pem, DkimSigningAlgorithm::Rsa)
-                        .map_err(|e| {
-                            DirectToMxError::Dkim(format!("failed to parse DKIM key: {e}"))
-                        })?;
+                let _ = DkimSigningKey::new(&opts.private_key_pem, DkimSigningAlgorithm::Rsa)
+                    .map_err(|e| DirectToMxError::Dkim(format!("failed to parse DKIM key: {e}")))?;
                 Some(CachedDkim {
                     selector: opts.selector,
                     domain: opts.domain,
@@ -259,12 +256,7 @@ impl DirectToMxBuilder {
 
 impl DirectToMx {
     /// Send a single email to `to` with the given `subject` and `body`.
-    pub async fn send(
-        &self,
-        to: &str,
-        subject: &str,
-        body: Body,
-    ) -> Result<(), DirectToMxError> {
+    pub async fn send(&self, to: &str, subject: &str, body: Body) -> Result<(), DirectToMxError> {
         self.send_with_attachments(to, subject, body, Vec::new())
             .await
     }
@@ -313,7 +305,8 @@ impl DirectToMx {
 
             // Prepare the message (build + DKIM sign) on the current task so
             // errors are captured per-message without spawning.
-            let prepared = self.prepare_message(&msg.to, &msg.subject, msg.body.clone(), &msg.attachments);
+            let prepared =
+                self.prepare_message(&msg.to, &msg.subject, msg.body.clone(), &msg.attachments);
             let to = msg.to.clone();
             let force_ipv4 = self.force_ipv4;
             let ehlo_hostname = self.ehlo_hostname.clone();
@@ -325,9 +318,9 @@ impl DirectToMx {
                 }
                 Err(e) => {
                     // Push a ready result for build failures
-                    handles.push(tokio::spawn(async move {
-                        BulkResult { to, status: Err(e) }
-                    }));
+                    handles.push(tokio::spawn(
+                        async move { BulkResult { to, status: Err(e) } },
+                    ));
                     continue;
                 }
             };
@@ -484,9 +477,7 @@ async fn deliver_with_fallback_static(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        DirectToMxError::Dns("no MX hosts available".into())
-    }))
+    Err(last_err.unwrap_or_else(|| DirectToMxError::Dns("no MX hosts available".into())))
 }
 
 async fn try_deliver(
@@ -495,9 +486,9 @@ async fn try_deliver(
     mx_host: &str,
     email: lettre::Message,
 ) -> Result<(), DirectToMxError> {
+    use lettre::AsyncTransport;
     use lettre::transport::smtp::client::{Tls, TlsParameters};
     use lettre::transport::smtp::extension::ClientId;
-    use lettre::AsyncTransport;
 
     let tls = match TlsParameters::new(mx_host.to_string()) {
         Ok(params) => Tls::Opportunistic(params),
@@ -511,15 +502,11 @@ async fn try_deliver(
             .tls(tls)
             .build();
 
-    transport
-        .send(email)
-        .await
-        .map(|_| ())
-        .map_err(|e| {
-            DirectToMxError::Smtp(format!(
-                "delivery to {connect_host} (MX: {mx_host}):25 failed: {e}"
-            ))
-        })
+    transport.send(email).await.map(|_| ()).map_err(|e| {
+        DirectToMxError::Smtp(format!(
+            "delivery to {connect_host} (MX: {mx_host}):25 failed: {e}"
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -534,7 +521,7 @@ fn build_message(
     body: Body,
     attachments: &[Attachment],
 ) -> Result<lettre::Message, DirectToMxError> {
-    use lettre::message::{header::ContentType, MultiPart, SinglePart};
+    use lettre::message::{MultiPart, SinglePart, header::ContentType};
 
     let builder = lettre::Message::builder()
         .from(from.parse()?)
@@ -578,8 +565,7 @@ fn build_message(
                 .parse()
                 .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
             mixed = mixed.singlepart(
-                lettre::message::Attachment::new(att.filename.clone())
-                    .body(att.data.clone(), ct),
+                lettre::message::Attachment::new(att.filename.clone()).body(att.data.clone(), ct),
             );
         }
         builder.multipart(mixed)?

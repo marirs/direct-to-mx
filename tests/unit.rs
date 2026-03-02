@@ -1,5 +1,5 @@
-use std::path::Path;
 use direct_to_mx::*;
+use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Builder validation
@@ -17,15 +17,10 @@ fn builder_requires_from() {
 
 #[test]
 fn builder_requires_ehlo_hostname() {
-    let err = DirectToMx::builder()
-        .from("test@example.com")
-        .build();
+    let err = DirectToMx::builder().from("test@example.com").build();
     assert!(err.is_err());
     let msg = err.unwrap_err().to_string();
-    assert!(
-        msg.contains("ehlo"),
-        "expected 'ehlo' in error: {msg}"
-    );
+    assert!(msg.contains("ehlo"), "expected 'ehlo' in error: {msg}");
 }
 
 #[test]
@@ -223,8 +218,7 @@ fn error_display_message() {
 
 #[test]
 fn error_is_std_error() {
-    let e: Box<dyn std::error::Error> =
-        Box::new(DirectToMxError::Config("test".into()));
+    let e: Box<dyn std::error::Error> = Box::new(DirectToMxError::Config("test".into()));
     assert!(e.to_string().contains("test"));
 }
 
@@ -234,9 +228,7 @@ fn error_is_std_error() {
 
 #[test]
 fn dns_verify_report_all_pass_when_empty() {
-    let report = DnsVerifyReport {
-        results: vec![],
-    };
+    let report = DnsVerifyReport { results: vec![] };
     assert!(report.all_pass());
 }
 
@@ -368,7 +360,11 @@ fn outbound_message_with_attachments() {
         to: "a@example.com".into(),
         subject: "Hi".into(),
         body: Body::text("hello"),
-        attachments: vec![Attachment::new("file.pdf", "application/pdf", vec![1, 2, 3])],
+        attachments: vec![Attachment::new(
+            "file.pdf",
+            "application/pdf",
+            vec![1, 2, 3],
+        )],
     };
     assert_eq!(msg.attachments.len(), 1);
     assert_eq!(msg.attachments[0].filename, "file.pdf");
@@ -424,7 +420,10 @@ fn attachment_from_file_nonexistent() {
     let err = Attachment::from_file(Path::new("/tmp/nonexistent_file_xyz_123.pdf"));
     assert!(err.is_err());
     let msg = err.unwrap_err().to_string();
-    assert!(msg.contains("failed to read"), "expected 'failed to read' in: {msg}");
+    assert!(
+        msg.contains("failed to read"),
+        "expected 'failed to read' in: {msg}"
+    );
 }
 
 #[test]

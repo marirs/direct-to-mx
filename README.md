@@ -1,5 +1,10 @@
 # direct_to_mx
 
+[![CI](https://github.com/marirs/direct-to-mx/actions/workflows/ci.yml/badge.svg)](https://github.com/marirs/direct-to-mx/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/direct_to_mx.svg)](https://crates.io/crates/direct_to_mx)
+[![docs.rs](https://docs.rs/direct_to_mx/badge.svg)](https://docs.rs/direct_to_mx)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Direct-to-MX email delivery with DKIM signing, IPv4 forcing, MX fallback, DKIM key generation, and DNS verification.
 
 Send emails directly to recipient MX servers — no relay, no third-party API. Handles MX resolution, IPv4-only connections (avoids IPv6 PTR rejections from Gmail/Outlook), opportunistic STARTTLS, DKIM signing with `relaxed/relaxed` canonicalization, and automatic fallback across multiple MX hosts.

@@ -95,9 +95,7 @@ impl DnsVerifyReport {
 ///
 /// Each check runs independently — a failure in one does not prevent the
 /// others from executing.
-pub async fn verify_dns(
-    opts: &DnsVerifyOptions,
-) -> Result<DnsVerifyReport, DirectToMxError> {
+pub async fn verify_dns(opts: &DnsVerifyOptions) -> Result<DnsVerifyReport, DirectToMxError> {
     if opts.domain.is_empty() {
         return Err(DirectToMxError::Config("domain must not be empty".into()));
     }
@@ -116,10 +114,7 @@ pub async fn verify_dns(
     results.push(check_a(&resolver, &opts.domain).await);
 
     // PTR (reverse DNS)
-    let ehlo = opts
-        .ehlo_hostname
-        .as_deref()
-        .unwrap_or(&opts.domain);
+    let ehlo = opts.ehlo_hostname.as_deref().unwrap_or(&opts.domain);
     results.push(check_ptr(&resolver, &opts.domain, ehlo).await);
 
     // SPF
@@ -146,10 +141,7 @@ pub async fn verify_dns(
 // Individual checks
 // ---------------------------------------------------------------------------
 
-async fn check_mx(
-    resolver: &hickory_resolver::TokioAsyncResolver,
-    domain: &str,
-) -> DnsCheckResult {
+async fn check_mx(resolver: &hickory_resolver::TokioAsyncResolver, domain: &str) -> DnsCheckResult {
     match resolver.mx_lookup(domain).await {
         Ok(mx) => {
             let records: Vec<String> = mx
@@ -184,10 +176,7 @@ async fn check_mx(
     }
 }
 
-async fn check_a(
-    resolver: &hickory_resolver::TokioAsyncResolver,
-    domain: &str,
-) -> DnsCheckResult {
+async fn check_a(resolver: &hickory_resolver::TokioAsyncResolver, domain: &str) -> DnsCheckResult {
     match resolver.lookup_ip(domain).await {
         Ok(ips) => {
             let addrs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
@@ -227,7 +216,7 @@ async fn check_ptr(
                     check: DnsCheck::Ptr,
                     status: DnsCheckStatus::Fail,
                     detail: "no IPv4 A record to check PTR for".into(),
-                }
+                };
             }
         },
         Err(_) => {
@@ -235,7 +224,7 @@ async fn check_ptr(
                 check: DnsCheck::Ptr,
                 status: DnsCheckStatus::Fail,
                 detail: "no A record found — cannot check PTR".into(),
-            }
+            };
         }
     };
 
@@ -307,7 +296,7 @@ async fn check_dkim(
                 check: DnsCheck::Dkim,
                 status: DnsCheckStatus::Skip,
                 detail: "no DKIM selector provided".into(),
-            }
+            };
         }
     };
 
