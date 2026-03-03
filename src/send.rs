@@ -19,6 +19,15 @@ pub enum Body {
     Text(String),
     /// Multipart/alternative with both a plain-text and an HTML part.
     Both { html: String, text: String },
+    /// Pre-formatted body with a custom Content-Type (e.g. `multipart/signed`).
+    /// The caller is responsible for providing a valid MIME body.
+    Raw {
+        /// Full Content-Type header value, e.g.
+        /// `"multipart/signed; protocol=\"application/pgp-signature\"; boundary=\"abc\""`
+        content_type: String,
+        /// The raw MIME body.
+        body: String,
+    },
 }
 
 impl Body {
@@ -37,6 +46,14 @@ impl Body {
         Self::Both {
             html: html.into(),
             text: text.into(),
+        }
+    }
+
+    /// Convenience constructor for a pre-formatted raw body.
+    pub fn raw(content_type: impl Into<String>, body: impl Into<String>) -> Self {
+        Self::Raw {
+            content_type: content_type.into(),
+            body: body.into(),
         }
     }
 }
@@ -542,6 +559,16 @@ fn build_message(
         .message_id(Some(message_id.to_string()))
         .subject(subject);
 
+    // Raw body: caller provides the full Content-Type and MIME body.
+    // This bypasses MultiPart wrapping entirely (attachments are ignored).
+    if let Body::Raw { content_type, body } = body {
+        let ct: ContentType = content_type
+            .parse()
+            .map_err(|e| DirectToMxError::Message(format!("invalid Content-Type: {e}")))?;
+        let email = builder.header(ct).body(body)?;
+        return Ok(email);
+    }
+
     // Build the body part
     let body_part = match body {
         Body::Html(html) => MultiPart::alternative().singlepart(
@@ -565,6 +592,7 @@ fn build_message(
                     .header(ContentType::TEXT_HTML)
                     .body(html),
             ),
+        Body::Raw { .. } => unreachable!(),
     };
 
     let email = if attachments.is_empty() {
