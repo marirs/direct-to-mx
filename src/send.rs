@@ -644,7 +644,8 @@ const DKIM_SIGNED_HEADERS: &[&str] = &[
 fn dkim_sign_raw(raw: &[u8], dkim: &CachedDkim) -> Vec<u8> {
     use base64::Engine;
     use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs1v15::Pkcs1v15Sign;
+    use rsa::pkcs1v15::SigningKey;
+    use rsa::signature::{SignatureEncoding, SignerMut};
     use sha2::{Digest, Sha256};
 
     let private_key = match rsa::RsaPrivateKey::from_pkcs1_pem(&dkim.private_key_pem) {
@@ -730,10 +731,10 @@ fn dkim_sign_raw(raw: &[u8], dkim: &CachedDkim) -> Vec<u8> {
     let canon_dkim = relaxed_header_canon(&dkim_full);
     canon_input.push_str(&canon_dkim);
 
-    // 6. Hash and sign
-    let header_hash = Sha256::digest(canon_input.as_bytes());
-    let signature = match private_key.sign(Pkcs1v15Sign::new::<Sha256>(), &header_hash) {
-        Ok(sig) => base64::engine::general_purpose::STANDARD.encode(&sig),
+    // 6. Sign (SigningKey hashes the raw canon_input internally with SHA-256)
+    let mut signing_key = SigningKey::<Sha256>::new(private_key);
+    let signature = match signing_key.try_sign(canon_input.as_bytes()) {
+        Ok(sig) => base64::engine::general_purpose::STANDARD.encode(sig.to_bytes()),
         Err(e) => {
             eprintln!("direct_to_mx: RSA signing failed: {e}");
             return raw.to_vec();
