@@ -561,11 +561,17 @@ fn build_message(
 
     // Raw body: caller provides the full Content-Type and MIME body.
     // This bypasses MultiPart wrapping entirely (attachments are ignored).
+    // We pass a pre-encoded lettre::message::body::Body so lettre does NOT
+    // validate or re-encode the content (critical for multipart/signed).
     if let Body::Raw { content_type, body } = body {
         let ct: ContentType = content_type
             .parse()
             .map_err(|e| DirectToMxError::Message(format!("invalid Content-Type: {e}")))?;
-        let email = builder.header(ct).body(body)?;
+        let raw_body = lettre::message::Body::dangerous_pre_encoded(
+            body.into_bytes(),
+            lettre::message::header::ContentTransferEncoding::SevenBit,
+        );
+        let email = builder.header(ct).body(raw_body)?;
         return Ok(email);
     }
 
@@ -769,10 +775,15 @@ fn dkim_sign_raw(raw: &[u8], dkim: &CachedDkim) -> Vec<u8> {
         }
     };
 
-    // 7. Build the final DKIM-Signature header with the real b= value
+    // 7. Build the final DKIM-Signature header with the real b= value.
+    //    Fold the header at tag boundaries using CRLF+TAB (RFC 6376 §3.7)
+    //    so no SMTP relay needs to re-fold it (which would break verification).
     let final_dkim_header = format!(
-        "DKIM-Signature: v=1; a=rsa-sha256; d={domain}; s={selector}; c=relaxed/relaxed; \
-         q=dns/txt; t={timestamp}; h={h_list}; bh={bh}; b={signature}",
+        "DKIM-Signature: v=1; a=rsa-sha256; d={domain}; s={selector};\r\n\
+         \tc=relaxed/relaxed; q=dns/txt; t={timestamp};\r\n\
+         \th={h_list};\r\n\
+         \tbh={bh};\r\n\
+         \tb={signature}",
         domain = dkim.domain,
         selector = dkim.selector,
     );
@@ -1228,10 +1239,11 @@ mod tests {
         let signed = dkim_sign_raw(&raw, &dkim);
         let signed_str = String::from_utf8_lossy(&signed);
 
-        // Extract the h= tag and verify each header appears twice
-        let h_start = signed_str.find("h=").expect("no h= tag");
-        let h_end = signed_str[h_start..].find(';').unwrap() + h_start;
-        let h_value = &signed_str[h_start + 2..h_end];
+        // Unfold the DKIM header before extracting the h= tag
+        let unfolded = signed_str.replace("\r\n\t", " ").replace("\r\n ", " ");
+        let h_start = unfolded.find("h=").expect("no h= tag");
+        let h_end = unfolded[h_start..].find(';').unwrap() + h_start;
+        let h_value = &unfolded[h_start + 2..h_end];
         let names: Vec<&str> = h_value.split(':').collect();
         // Each of the 6 signed headers should appear exactly twice
         for hdr in &[
@@ -1280,9 +1292,23 @@ mod tests {
         );
 
         // Now inject a duplicate From header after the DKIM-Signature
-        // (simulating a malicious relay prepending a header)
+        // (simulating a malicious relay prepending a header).
+        // The DKIM-Signature is folded, so skip past all continuation lines.
         let signed_str = String::from_utf8_lossy(&signed);
-        let dkim_end = signed_str.find("\r\n").unwrap() + 2;
+        let mut dkim_end = 0;
+        let mut first = true;
+        for line in signed_str.split("\r\n") {
+            if first {
+                first = false;
+                dkim_end += line.len() + 2;
+                continue;
+            }
+            if line.starts_with('\t') || line.starts_with(' ') {
+                dkim_end += line.len() + 2;
+            } else {
+                break;
+            }
+        }
         let mut tampered = Vec::new();
         tampered.extend_from_slice(&signed[..dkim_end]);
         tampered.extend_from_slice(b"From: attacker@evil.com\r\n");
@@ -1310,5 +1336,404 @@ mod tests {
         let raw = email.formatted();
         let raw_str = String::from_utf8_lossy(&raw);
         assert!(!raw_str.contains("DKIM-Signature"));
+    }
+
+    #[test]
+    fn dkim_sign_and_verify_body_raw_simple() {
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let email = build_message(
+            "no-reply@example.com",
+            "user@gmail.com",
+            "Raw body DKIM test",
+            "<raw.1@example.com>",
+            Body::raw(
+                "text/html; charset=utf-8".to_string(),
+                "<h1>Hello from raw</h1>".to_string(),
+            ),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+
+        assert!(
+            verify_dkim_signature(&signed, &kp.private_key_pem),
+            "DKIM verification failed for Body::Raw simple email"
+        );
+    }
+
+    #[test]
+    fn dkim_sign_and_verify_body_raw_pgp_mime_multipart_signed() {
+        // This is the EXACT scenario that broke in production:
+        // PGP/MIME multipart/signed body with QP-encoded inner HTML containing
+        // a long magic-link URL with = chars.
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let boundary = "----pgp-abc123def456";
+        let long_token = "f8c5b7b3a2c78762fdc5069123bb087584d2ec012f24300da1a3c971be61be07";
+        // QP-encoded HTML (= encoded as =3D, lines soft-wrapped with =\r\n)
+        let qp_html = format!(
+            "<p>Click to sign in:</p><p><a href=3D\"https://indev.email/auth/callback?token=3D{}\">Sign=\r\n in</a></p>",
+            long_token
+        );
+        let ct = format!(
+            "multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"{}\"",
+            boundary
+        );
+        let body = format!(
+            "--{b}\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Transfer-Encoding: quoted-printable\r\n\
+             \r\n\
+             {html}\r\n\
+             --{b}\r\n\
+             Content-Type: application/pgp-signature; name=\"signature.asc\"\r\n\
+             Content-Disposition: attachment; filename=\"signature.asc\"\r\n\
+             Content-Transfer-Encoding: 7bit\r\n\
+             \r\n\
+             -----BEGIN PGP SIGNATURE-----\r\n\
+             \r\n\
+             iHUEARYIAB0WIQT/fake/signature/here/AAAAAAAAAAAAAAAA\r\n\
+             =AAAA\r\n\
+             -----END PGP SIGNATURE-----\r\n\
+             --{b}--",
+            b = boundary,
+            html = qp_html
+        );
+
+        let email = build_message(
+            "no-reply@indev.email",
+            "marirs@gmail.com",
+            "Your sign-in link",
+            "<magic.link@indev.email>",
+            Body::raw(ct, body),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+
+        // 1) DKIM must verify
+        assert!(
+            verify_dkim_signature(&signed, &kp.private_key_pem),
+            "DKIM verification failed for PGP/MIME multipart/signed email"
+        );
+
+        // 2) Body must not be re-encoded (no double QP)
+        let signed_str = String::from_utf8_lossy(&signed);
+        assert!(
+            signed_str.contains(long_token),
+            "long token must be present verbatim in signed output"
+        );
+        assert!(
+            signed_str.contains("BEGIN PGP SIGNATURE"),
+            "PGP signature block must be present"
+        );
+        assert!(
+            signed_str.contains(boundary),
+            "boundary must be intact"
+        );
+    }
+
+    #[test]
+    fn dkim_body_raw_tamper_detected() {
+        // Verify that modifying the Body::Raw content after DKIM signing
+        // causes verification to fail (body hash mismatch)
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let email = build_message(
+            "no-reply@example.com",
+            "user@gmail.com",
+            "Tamper test",
+            "<tamper.1@example.com>",
+            Body::raw(
+                "text/html; charset=utf-8".to_string(),
+                "<p>Original content</p>".to_string(),
+            ),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+
+        // Original must verify
+        assert!(
+            verify_dkim_signature(&signed, &kp.private_key_pem),
+            "original raw body must pass DKIM"
+        );
+
+        // Tamper with the body
+        let tampered = String::from_utf8_lossy(&signed)
+            .replace("Original content", "Tampered content");
+
+        assert!(
+            !verify_dkim_signature(tampered.as_bytes(), &kp.private_key_pem),
+            "tampered raw body must FAIL DKIM verification"
+        );
+    }
+
+    #[test]
+    fn dkim_body_raw_pgp_header_folding_diagnostic() {
+        // Reproduce the exact prod scenario: Body::Raw with long
+        // multipart/signed Content-Type + DKIM signing.
+        // Dump the raw formatted output to inspect header folding.
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let boundary = "----pgp-922b97cdcc0521b15e4052396e510880";
+        let ct = format!(
+            "multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"{}\"",
+            boundary
+        );
+        let body = format!(
+            "--{b}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<p>test</p>\r\n--{b}\r\nContent-Type: application/pgp-signature\r\nContent-Transfer-Encoding: 7bit\r\n\r\n-----BEGIN PGP SIGNATURE-----\r\n\r\nfakesig\r\n-----END PGP SIGNATURE-----\r\n--{b}--",
+            b = boundary
+        );
+
+        let email = build_message(
+            "no-reply@indev.email",
+            "marirs@gmail.com",
+            "Your sign-in link",
+            "<test.123@indev.email>",
+            Body::raw(ct, body),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let raw_str = String::from_utf8_lossy(&raw);
+
+        // Print the exact header block
+        let header_end = raw_str.find("\r\n\r\n").unwrap();
+        let headers = &raw_str[..header_end];
+        eprintln!("=== RAW HEADERS (before DKIM) ===");
+        for line in headers.split("\r\n") {
+            eprintln!("  |{}|", line);
+        }
+
+        // Now DKIM-sign and print the signed output
+        let signed = dkim_sign_raw(&raw, &dkim);
+        let signed_str = String::from_utf8_lossy(&signed);
+        let signed_header_end = signed_str.find("\r\n\r\n").unwrap();
+        let signed_headers = &signed_str[..signed_header_end];
+        eprintln!("=== RAW HEADERS (after DKIM) ===");
+        for line in signed_headers.split("\r\n") {
+            eprintln!("  |{}|", line);
+        }
+
+        // Verify DKIM passes on our own output
+        assert!(
+            verify_dkim_signature(&signed, &kp.private_key_pem),
+            "DKIM verification must pass on our own formatted output"
+        );
+
+        // Now simulate what an SMTP relay might do: re-fold long headers.
+        // Gmail sees the Content-Type header and might parse it differently.
+        // Check if the Content-Type header in formatted output is folded.
+        let ct_header = signed_headers.split("\r\n")
+            .find(|l| l.starts_with("Content-Type:"))
+            .unwrap_or("");
+        eprintln!("=== Content-Type header line ===");
+        eprintln!("  len={} |{}|", ct_header.len(), ct_header);
+
+        // Check for continuation lines
+        let mut ct_full = String::new();
+        let mut in_ct = false;
+        for line in signed_headers.split("\r\n") {
+            if line.starts_with("Content-Type:") {
+                in_ct = true;
+                ct_full.push_str(line);
+            } else if in_ct && (line.starts_with(' ') || line.starts_with('\t')) {
+                ct_full.push_str("\r\n");
+                ct_full.push_str(line);
+            } else {
+                in_ct = false;
+            }
+        }
+        eprintln!("=== Full Content-Type (with folds) ===");
+        eprintln!("  |{}|", ct_full);
+    }
+
+    #[test]
+    fn body_raw_formatted_body_matches_input() {
+        // This test verifies that the body bytes in email.formatted() are
+        // EXACTLY what we passed in via Body::Raw. Any difference means
+        // the DKIM body hash will mismatch what receivers compute.
+        let boundary = "----pgp-test9999";
+        let ct = format!(
+            "multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"{}\"",
+            boundary
+        );
+        let input_body = format!(
+            "--{b}\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Transfer-Encoding: quoted-printable\r\n\
+             \r\n\
+             <p>test</p>\r\n\
+             --{b}\r\n\
+             Content-Type: application/pgp-signature\r\n\
+             \r\n\
+             -----BEGIN PGP SIGNATURE-----\r\nfake\r\n-----END PGP SIGNATURE-----\r\n\
+             --{b}--",
+            b = boundary
+        );
+
+        let email = build_message(
+            "a@test.com",
+            "b@test.com",
+            "test",
+            "<id@test.com>",
+            Body::raw(ct, input_body.clone()),
+            &[],
+        )
+        .unwrap();
+
+        let formatted = email.formatted();
+        let formatted_str = String::from_utf8_lossy(&formatted);
+
+        // Extract body from formatted output (after \r\n\r\n)
+        let body_start = formatted_str.find("\r\n\r\n").expect("no header/body sep") + 4;
+        let output_body = &formatted_str[body_start..];
+
+        // Compare
+        if output_body != input_body {
+            eprintln!("=== INPUT BODY ({} bytes) ===", input_body.len());
+            eprintln!("{:?}", input_body.as_bytes());
+            eprintln!("=== OUTPUT BODY ({} bytes) ===", output_body.len());
+            eprintln!("{:?}", output_body.as_bytes());
+
+            // Show first difference
+            for (i, (a, b)) in input_body.bytes().zip(output_body.bytes()).enumerate() {
+                if a != b {
+                    eprintln!("First diff at byte {}: input=0x{:02x}({}) output=0x{:02x}({})",
+                        i, a, a as char, b, b as char);
+                    break;
+                }
+            }
+            if input_body.len() != output_body.len() {
+                eprintln!("Length mismatch: input={} output={}", input_body.len(), output_body.len());
+                if output_body.len() > input_body.len() {
+                    eprintln!("Extra bytes at end: {:?}", &output_body.as_bytes()[input_body.len()..]);
+                }
+            }
+            panic!("Body::Raw output does not match input — DKIM body hash WILL fail");
+        }
+    }
+
+    #[test]
+    fn body_raw_no_panic_with_multipart_signed() {
+        // Simulate a PGP/MIME multipart/signed body with QP-encoded inner part
+        let boundary = "----pgp-test1234";
+        let ct = format!(
+            "multipart/signed; protocol=\"application/pgp-signature\"; micalg=pgp-sha256; boundary=\"{}\"",
+            boundary
+        );
+        let body = format!(
+            "--{b}\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             Content-Transfer-Encoding: quoted-printable\r\n\
+             \r\n\
+             <p>Click: <a href=3D\"https://example.com/auth?token=3Dabcdef1234567890=\r\nabcdef\">Sign in</a></p>\r\n\
+             --{b}\r\n\
+             Content-Type: application/pgp-signature; name=\"signature.asc\"\r\n\
+             Content-Transfer-Encoding: 7bit\r\n\
+             \r\n\
+             -----BEGIN PGP SIGNATURE-----\r\nfakesig\r\n-----END PGP SIGNATURE-----\r\n\
+             --{b}--",
+            b = boundary
+        );
+        // This must NOT panic (previous bug: lettre's SevenBit validation panicked)
+        let email = build_message(
+            "no-reply@example.com",
+            "user@example.com",
+            "Test",
+            "<id@example.com>",
+            Body::raw(ct, body),
+            &[],
+        )
+        .unwrap();
+
+        let formatted = email.formatted();
+        let raw = String::from_utf8_lossy(&formatted);
+        // Body must pass through without QP re-encoding
+        assert!(
+            !raw.contains("Content-Transfer-Encoding: quoted-printable\r\n\r\nContent-Type:"),
+            "outer body should not be QP-encoded"
+        );
+        assert!(raw.contains("----pgp-test1234"), "boundary must be intact");
+        assert!(
+            raw.contains("BEGIN PGP SIGNATURE"),
+            "signature must be present"
+        );
+    }
+
+    #[test]
+    fn body_raw_preserves_content_verbatim() {
+        let ct = "text/plain; charset=utf-8".to_string();
+        let body_text = "Hello =3D World\r\nLine two with special chars: àéîõü".to_string();
+        let email = build_message(
+            "a@test.com",
+            "b@test.com",
+            "raw test",
+            "<id@test.com>",
+            Body::raw(ct, body_text.clone()),
+            &[],
+        )
+        .unwrap();
+
+        let formatted = email.formatted();
+        let raw = String::from_utf8_lossy(&formatted);
+        // The exact body text must appear verbatim — no encoding applied
+        assert!(
+            raw.contains(&body_text),
+            "body must be preserved verbatim, got: {raw}"
+        );
+    }
+
+    #[test]
+    fn body_raw_with_long_url_no_line_wrap() {
+        let long_url = format!("https://example.com/auth/callback?token={}", "a".repeat(200));
+        let ct = "text/html; charset=utf-8".to_string();
+        let body = format!("<a href=\"{}\">{}</a>", long_url, long_url);
+        let email = build_message(
+            "a@test.com",
+            "b@test.com",
+            "long url",
+            "<id@test.com>",
+            Body::raw(ct, body),
+            &[],
+        )
+        .unwrap();
+
+        let formatted = email.formatted();
+        let raw = String::from_utf8_lossy(&formatted);
+        // The long URL must not be split across lines by lettre
+        assert!(
+            raw.contains(&long_url),
+            "long URL must not be line-wrapped"
+        );
     }
 }
