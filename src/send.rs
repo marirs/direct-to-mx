@@ -229,8 +229,8 @@ impl DirectToMxBuilder {
         // Validate DKIM key eagerly so build() fails fast on bad keys
         let cached_dkim = match self.dkim {
             Some(opts) => {
-                use lettre::message::dkim::{DkimSigningAlgorithm, DkimSigningKey};
-                let _ = DkimSigningKey::new(&opts.private_key_pem, DkimSigningAlgorithm::Rsa)
+                use rsa::pkcs1::DecodeRsaPrivateKey;
+                let _ = rsa::RsaPrivateKey::from_pkcs1_pem(&opts.private_key_pem)
                     .map_err(|e| DirectToMxError::Dkim(format!("failed to parse DKIM key: {e}")))?;
                 Some(CachedDkim {
                     selector: opts.selector,
@@ -269,13 +269,21 @@ impl DirectToMx {
         body: Body,
         attachments: Vec<Attachment>,
     ) -> Result<(), DirectToMxError> {
-        let mut email = self.prepare_message(to, subject, body, &attachments)?;
-        self.sign_message(&mut email);
+        let email = self.prepare_message(to, subject, body, &attachments)?;
+        let envelope = email.envelope().clone();
+        let raw = self.sign_to_raw(email);
 
         let rcpt_domain = to.rsplit_once('@').map(|(_, d)| d).unwrap_or(to);
         let mx_hosts = resolve_mx(rcpt_domain).await;
 
-        self.deliver_with_fallback(&mx_hosts, email).await
+        deliver_with_fallback_raw(
+            &self.ehlo_hostname,
+            self.force_ipv4,
+            &mx_hosts,
+            &envelope,
+            &raw,
+        )
+        .await
     }
 
     /// Send multiple emails concurrently.
@@ -311,10 +319,11 @@ impl DirectToMx {
             let force_ipv4 = self.force_ipv4;
             let ehlo_hostname = self.ehlo_hostname.clone();
 
-            let email = match prepared {
-                Ok(mut email) => {
-                    self.sign_message(&mut email);
-                    email
+            let (envelope, raw) = match prepared {
+                Ok(email) => {
+                    let env = email.envelope().clone();
+                    let raw = self.sign_to_raw(email);
+                    (env, raw)
                 }
                 Err(e) => {
                     // Push a ready result for build failures
@@ -345,9 +354,14 @@ impl DirectToMx {
                     }
                 };
 
-                let status =
-                    deliver_with_fallback_static(&ehlo_hostname, force_ipv4, &mx_hosts, email)
-                        .await;
+                let status = deliver_with_fallback_raw(
+                    &ehlo_hostname,
+                    force_ipv4,
+                    &mx_hosts,
+                    &envelope,
+                    &raw,
+                )
+                .await;
                 BulkResult { to, status }
             }));
         }
@@ -431,20 +445,13 @@ impl DirectToMx {
         build_message(&self.from, to, subject, &message_id, body, attachments)
     }
 
-    /// DKIM-sign a message using the cached signer.
-    fn sign_message(&self, email: &mut lettre::Message) {
-        if let Some(ref dkim) = self.dkim {
-            sign_dkim_cached(email, dkim);
+    /// Format the message and optionally DKIM-sign it, returning final raw bytes.
+    fn sign_to_raw(&self, email: lettre::Message) -> Vec<u8> {
+        let raw = email.formatted();
+        match self.dkim {
+            Some(ref dkim) => dkim_sign_raw(&raw, dkim),
+            None => raw,
         }
-    }
-
-    /// Try all MX hosts in priority order for a single email.
-    async fn deliver_with_fallback(
-        &self,
-        mx_hosts: &[String],
-        email: lettre::Message,
-    ) -> Result<(), DirectToMxError> {
-        deliver_with_fallback_static(&self.ehlo_hostname, self.force_ipv4, mx_hosts, email).await
     }
 }
 
@@ -452,11 +459,12 @@ impl DirectToMx {
 // Free-standing delivery (used by both send() and send_bulk() tasks)
 // ---------------------------------------------------------------------------
 
-async fn deliver_with_fallback_static(
+async fn deliver_with_fallback_raw(
     ehlo_hostname: &str,
     force_ipv4: bool,
     mx_hosts: &[String],
-    email: lettre::Message,
+    envelope: &lettre::address::Envelope,
+    raw: &[u8],
 ) -> Result<(), DirectToMxError> {
     let mut last_err: Option<DirectToMxError> = None;
     for mx_host in mx_hosts {
@@ -466,7 +474,7 @@ async fn deliver_with_fallback_static(
             mx_host.clone()
         };
 
-        match try_deliver(ehlo_hostname, &connect_host, mx_host, email.clone()).await {
+        match try_deliver_raw(ehlo_hostname, &connect_host, mx_host, envelope, raw).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 eprintln!(
@@ -480,11 +488,12 @@ async fn deliver_with_fallback_static(
     Err(last_err.unwrap_or_else(|| DirectToMxError::Dns("no MX hosts available".into())))
 }
 
-async fn try_deliver(
+async fn try_deliver_raw(
     ehlo_hostname: &str,
     connect_host: &str,
     mx_host: &str,
-    email: lettre::Message,
+    envelope: &lettre::address::Envelope,
+    raw: &[u8],
 ) -> Result<(), DirectToMxError> {
     use lettre::AsyncTransport;
     use lettre::transport::smtp::client::{Tls, TlsParameters};
@@ -502,11 +511,15 @@ async fn try_deliver(
             .tls(tls)
             .build();
 
-    transport.send(email).await.map(|_| ()).map_err(|e| {
-        DirectToMxError::Smtp(format!(
-            "delivery to {connect_host} (MX: {mx_host}):25 failed: {e}"
-        ))
-    })
+    transport
+        .send_raw(envelope, raw)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            DirectToMxError::Smtp(format!(
+                "delivery to {connect_host} (MX: {mx_host}):25 failed: {e}"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -611,42 +624,197 @@ fn mime_from_extension(path: &std::path::Path) -> &'static str {
     }
 }
 
-/// DKIM sign using the pre-parsed (cached) signing key.
-fn sign_dkim_cached(email: &mut lettre::Message, dkim: &CachedDkim) {
-    use lettre::message::dkim::{
-        DkimCanonicalization, DkimCanonicalizationType, DkimConfig, DkimSigningAlgorithm,
-        DkimSigningKey,
-    };
-    use lettre::message::header::HeaderName;
+/// Headers to include in the DKIM signature.
+const DKIM_SIGNED_HEADERS: &[&str] = &[
+    "From",
+    "To",
+    "Subject",
+    "Date",
+    "Message-ID",
+    "Content-Type",
+];
 
-    // Key was validated at build() time so this should not fail.
-    let signing_key = match DkimSigningKey::new(&dkim.private_key_pem, DkimSigningAlgorithm::Rsa) {
+/// Manual DKIM signing on the final formatted bytes of the message.
+/// Returns new raw bytes with DKIM-Signature prepended.
+///
+/// This bypasses lettre's broken `Message::sign()` which canonicalizes
+/// headers using pre-fold values instead of the actual wire format.
+fn dkim_sign_raw(raw: &[u8], dkim: &CachedDkim) -> Vec<u8> {
+    use base64::Engine;
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs1v15::Pkcs1v15Sign;
+    use sha2::{Digest, Sha256};
+
+    let private_key = match rsa::RsaPrivateKey::from_pkcs1_pem(&dkim.private_key_pem) {
         Ok(k) => k,
         Err(e) => {
             eprintln!("direct_to_mx: DKIM key parse failed, sending unsigned: {e}");
-            return;
+            return raw.to_vec();
         }
     };
 
-    let config = DkimConfig::new(
-        dkim.selector.clone(),
-        dkim.domain.clone(),
-        signing_key,
-        vec![
-            HeaderName::new_from_ascii_str("From"),
-            HeaderName::new_from_ascii_str("To"),
-            HeaderName::new_from_ascii_str("Subject"),
-            HeaderName::new_from_ascii_str("Date"),
-            HeaderName::new_from_ascii_str("Message-ID"),
-            HeaderName::new_from_ascii_str("Content-Type"),
-        ],
-        DkimCanonicalization {
-            header: DkimCanonicalizationType::Relaxed,
-            body: DkimCanonicalizationType::Relaxed,
-        },
+    let raw_str = String::from_utf8_lossy(raw);
+
+    // Split headers and body at the first blank line (\r\n\r\n)
+    let (header_block, body) = match raw_str.find("\r\n\r\n") {
+        Some(pos) => (&raw_str[..pos], &raw_str[pos + 4..]),
+        None => {
+            eprintln!("direct_to_mx: malformed message, no header/body separator");
+            return raw.to_vec();
+        }
+    };
+
+    // Parse headers from the formatted output (preserving folds)
+    let headers = parse_raw_headers(header_block);
+
+    // 1. Compute body hash (relaxed canonicalization)
+    let canon_body = relaxed_body_canon(body.as_bytes());
+    let body_hash = Sha256::digest(&canon_body);
+    let bh = base64::engine::general_purpose::STANDARD.encode(body_hash);
+
+    // 2. Build the h= tag value
+    let h_list: String = DKIM_SIGNED_HEADERS
+        .iter()
+        .map(|h| h.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(":");
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // 3. Build DKIM-Signature header with b= empty (for signing)
+    let dkim_hdr_value = format!(
+        "v=1; a=rsa-sha256; d={domain}; s={selector}; c=relaxed/relaxed; \
+         q=dns/txt; t={timestamp}; h={h_list}; bh={bh}; b=",
+        domain = dkim.domain,
+        selector = dkim.selector,
     );
 
-    email.sign(&config);
+    // 4. Canonicalize the signed headers (from the actual wire format)
+    let mut canon_input = String::new();
+    for hname in DKIM_SIGNED_HEADERS {
+        if let Some(full_line) = find_header_in_parsed(&headers, hname) {
+            let canon = relaxed_header_canon(&full_line);
+            canon_input.push_str(&canon);
+            canon_input.push_str("\r\n");
+        }
+    }
+
+    // 5. Append the DKIM-Signature header (with empty b=) — NO trailing CRLF
+    let dkim_full = format!("DKIM-Signature: {dkim_hdr_value}");
+    let canon_dkim = relaxed_header_canon(&dkim_full);
+    canon_input.push_str(&canon_dkim);
+
+    // 6. Hash and sign
+    let header_hash = Sha256::digest(canon_input.as_bytes());
+    let signature = match private_key.sign(Pkcs1v15Sign::new::<Sha256>(), &header_hash) {
+        Ok(sig) => base64::engine::general_purpose::STANDARD.encode(&sig),
+        Err(e) => {
+            eprintln!("direct_to_mx: RSA signing failed: {e}");
+            return raw.to_vec();
+        }
+    };
+
+    // 7. Build the final DKIM-Signature header with the real b= value
+    let final_dkim_header = format!(
+        "DKIM-Signature: v=1; a=rsa-sha256; d={domain}; s={selector}; c=relaxed/relaxed; \
+         q=dns/txt; t={timestamp}; h={h_list}; bh={bh}; b={signature}",
+        domain = dkim.domain,
+        selector = dkim.selector,
+    );
+
+    // 8. Prepend the DKIM-Signature to the raw message
+    let mut result = Vec::with_capacity(final_dkim_header.len() + 2 + raw.len());
+    result.extend_from_slice(final_dkim_header.as_bytes());
+    result.extend_from_slice(b"\r\n");
+    result.extend_from_slice(raw);
+    result
+}
+
+/// Parse raw headers from the header block, preserving continuation lines.
+/// Returns a list of (name, full_header_line_including_folds).
+fn parse_raw_headers(header_block: &str) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for line in header_block.split("\r\n") {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // Continuation line
+            if let Some(last) = headers.last_mut() {
+                last.1.push_str("\r\n");
+                last.1.push_str(line);
+            }
+        } else if let Some(colon) = line.find(':') {
+            let name = line[..colon].to_string();
+            headers.push((name, line.to_string()));
+        }
+    }
+    headers
+}
+
+/// Find a header by name (case-insensitive) from parsed headers.
+fn find_header_in_parsed(headers: &[(String, String)], name: &str) -> Option<String> {
+    let lower = name.to_lowercase();
+    headers
+        .iter()
+        .find(|(n, _)| n.to_lowercase() == lower)
+        .map(|(_, v)| v.clone())
+}
+
+/// Relaxed body canonicalization per RFC 6376 §3.4.4.
+fn relaxed_body_canon(body: &[u8]) -> Vec<u8> {
+    let s = String::from_utf8_lossy(body);
+    let mut out = Vec::with_capacity(body.len());
+    for line in s.split("\r\n") {
+        let mut cleaned = String::new();
+        let mut last_was_wsp = false;
+        for c in line.chars() {
+            if c == ' ' || c == '\t' {
+                last_was_wsp = true;
+            } else {
+                if last_was_wsp {
+                    cleaned.push(' ');
+                    last_was_wsp = false;
+                }
+                cleaned.push(c);
+            }
+        }
+        // Trailing whitespace on the line is already stripped by not flushing last_was_wsp
+        out.extend_from_slice(cleaned.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    // Remove trailing empty lines, but keep at least one CRLF
+    while out.ends_with(b"\r\n\r\n") {
+        out.truncate(out.len() - 2);
+    }
+    out
+}
+
+/// Relaxed header canonicalization per RFC 6376 §3.4.2.
+fn relaxed_header_canon(header_line: &str) -> String {
+    // Unfold continuation lines
+    let unfolded = header_line.replace("\r\n\t", " ").replace("\r\n ", " ");
+    let colon = match unfolded.find(':') {
+        Some(c) => c,
+        None => return unfolded.to_lowercase(),
+    };
+    let name = unfolded[..colon].to_lowercase();
+    let value = unfolded[colon + 1..].trim();
+    // Compress runs of whitespace to a single space
+    let mut compressed = String::new();
+    let mut last_was_wsp = false;
+    for c in value.chars() {
+        if c == ' ' || c == '\t' {
+            last_was_wsp = true;
+        } else {
+            if last_was_wsp {
+                compressed.push(' ');
+                last_was_wsp = false;
+            }
+            compressed.push(c);
+        }
+    }
+    format!("{}:{}", name, compressed)
 }
 
 /// Resolve MX hosts for a domain, sorted by preference (lowest = highest
@@ -701,4 +869,294 @@ fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut buf);
     hex::encode(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs1v15::VerifyingKey;
+    use rsa::signature::Verifier;
+    use sha2::{Digest, Sha256};
+
+    /// Independent DKIM verifier that mimics what Gmail/receivers do.
+    fn verify_dkim_signature(signed_raw: &[u8], pem: &str) -> bool {
+        let raw_str = String::from_utf8_lossy(signed_raw);
+        let (header_block, body) = {
+            let pos = raw_str.find("\r\n\r\n").expect("no header/body sep");
+            (&raw_str[..pos], &raw_str[pos + 4..])
+        };
+
+        let headers = parse_raw_headers(header_block);
+
+        // Find DKIM-Signature header
+        let dkim_full =
+            find_header_in_parsed(&headers, "DKIM-Signature").expect("no DKIM-Signature header");
+
+        let tags = parse_dkim_tag_values(&dkim_full);
+
+        // Verify body hash
+        let canon_body = relaxed_body_canon(body.as_bytes());
+        let body_hash = Sha256::digest(&canon_body);
+        let computed_bh = base64::engine::general_purpose::STANDARD.encode(&body_hash);
+        let claimed_bh = tags.get("bh").expect("no bh tag");
+        if computed_bh != *claimed_bh {
+            eprintln!("body hash mismatch: computed={computed_bh} claimed={claimed_bh}");
+            return false;
+        }
+
+        // Canonicalize signed headers for verification
+        let h_list = tags.get("h").expect("no h tag");
+        let header_names: Vec<&str> = h_list.split(':').collect();
+        let mut canon_input = String::new();
+        for hname in &header_names {
+            // Skip DKIM-Signature itself when looking for the named header
+            let lower = hname.to_lowercase();
+            let found = headers
+                .iter()
+                .find(|(n, _)| n.to_lowercase() == lower && n != "DKIM-Signature");
+            if let Some((_, full)) = found {
+                let canon = relaxed_header_canon(full);
+                canon_input.push_str(&canon);
+                canon_input.push_str("\r\n");
+            }
+        }
+
+        // Add DKIM-Signature with b= value emptied, NO trailing CRLF
+        let dkim_empty_b = empty_dkim_b_value(&dkim_full);
+        let canon_dkim = relaxed_header_canon(&dkim_empty_b);
+        canon_input.push_str(&canon_dkim);
+
+        // Verify RSA signature
+        let b_value = tags.get("b").expect("no b tag");
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(b_value)
+            .expect("bad base64 in b=");
+
+        let private_key = rsa::RsaPrivateKey::from_pkcs1_pem(pem).unwrap();
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let verifying_key = VerifyingKey::<Sha256>::new(public_key);
+        let signature =
+            rsa::pkcs1v15::Signature::try_from(sig_bytes.as_slice()).expect("bad signature bytes");
+
+        verifying_key
+            .verify(canon_input.as_bytes(), &signature)
+            .is_ok()
+    }
+
+    /// Parse DKIM tag=value pairs from a full DKIM-Signature header line.
+    fn parse_dkim_tag_values(header: &str) -> std::collections::HashMap<String, String> {
+        let mut map = std::collections::HashMap::new();
+        let colon = header.find(':').unwrap();
+        let value = &header[colon + 1..];
+        let unfolded: String = value.replace("\r\n\t", "").replace("\r\n ", "");
+        for part in unfolded.split(';') {
+            let part = part.trim();
+            if let Some(eq) = part.find('=') {
+                let k = part[..eq].trim().to_string();
+                let v = part[eq + 1..].trim().to_string();
+                map.insert(k, v);
+            }
+        }
+        map
+    }
+
+    /// Replace the b= value with empty in a DKIM-Signature header.
+    fn empty_dkim_b_value(dkim_header: &str) -> String {
+        let colon = dkim_header.find(':').unwrap();
+        let name_part = &dkim_header[..colon + 1];
+        let value_part = &dkim_header[colon + 1..];
+        let unfolded = value_part.replace("\r\n\t", " ").replace("\r\n ", " ");
+
+        let mut result = String::new();
+        let mut i = 0;
+        let bytes = unfolded.as_bytes();
+        while i < bytes.len() {
+            if i + 2 <= bytes.len() && bytes[i] == b'b' && bytes[i + 1] == b'=' {
+                // Make sure it's not "bh="
+                if i + 2 < bytes.len() && bytes[i + 1] == b'h' {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
+                // b= must follow a ; or space (not part of another tag)
+                if i > 0 && bytes[i - 1] != b' ' && bytes[i - 1] != b';' && bytes[i - 1] != b'\t' {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
+                result.push_str("b=");
+                i += 2;
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                continue;
+            }
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+
+        format!("{}{}", name_part, result)
+    }
+
+    #[test]
+    fn dkim_sign_and_verify_html_only() {
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let email = build_message(
+            "no-reply@example.com",
+            "user@gmail.com",
+            "Test Subject",
+            "<test.123@example.com>",
+            Body::html("<h1>Hello</h1>"),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+
+        assert!(
+            verify_dkim_signature(&signed, &kp.private_key_pem),
+            "DKIM verification failed for HTML-only email"
+        );
+    }
+
+    #[test]
+    fn dkim_sign_and_verify_multipart() {
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let email = build_message(
+            "no-reply@example.com",
+            "user@gmail.com",
+            "Test Subject",
+            "<test.456@example.com>",
+            Body::both("<h1>Hello</h1>", "Hello"),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+
+        assert!(
+            verify_dkim_signature(&signed, &kp.private_key_pem),
+            "DKIM verification failed for multipart email"
+        );
+    }
+
+    #[test]
+    fn dkim_sign_and_verify_text_only() {
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let email = build_message(
+            "no-reply@example.com",
+            "user@gmail.com",
+            "Test Subject",
+            "<test.789@example.com>",
+            Body::text("Hello world"),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+
+        assert!(
+            verify_dkim_signature(&signed, &kp.private_key_pem),
+            "DKIM verification failed for text-only email"
+        );
+    }
+
+    #[test]
+    fn dkim_sign_and_verify_with_attachment() {
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let att = Attachment::new("test.txt", "text/plain", b"file content".to_vec());
+        let email = build_message(
+            "no-reply@example.com",
+            "user@gmail.com",
+            "With attachment",
+            "<test.att@example.com>",
+            Body::html("<p>See attached</p>"),
+            &[att],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+
+        assert!(
+            verify_dkim_signature(&signed, &kp.private_key_pem),
+            "DKIM verification failed for email with attachment"
+        );
+    }
+
+    #[test]
+    fn dkim_signed_message_has_dkim_header() {
+        let kp = crate::generate_dkim_keypair("mysel", "test.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "mysel".into(),
+            domain: "test.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let email = build_message(
+            "a@test.com",
+            "b@example.com",
+            "hi",
+            "<id@test.com>",
+            Body::text("yo"),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+        let signed_str = String::from_utf8_lossy(&signed);
+
+        assert!(signed_str.starts_with("DKIM-Signature:"));
+        assert!(signed_str.contains("s=mysel"));
+        assert!(signed_str.contains("d=test.com"));
+        assert!(signed_str.contains("a=rsa-sha256"));
+        assert!(signed_str.contains("c=relaxed/relaxed"));
+    }
+
+    #[test]
+    fn no_dkim_without_config() {
+        let email = build_message(
+            "a@test.com",
+            "b@example.com",
+            "hi",
+            "<id@test.com>",
+            Body::text("yo"),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(!raw_str.contains("DKIM-Signature"));
+    }
 }
