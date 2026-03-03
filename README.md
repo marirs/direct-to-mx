@@ -13,8 +13,9 @@ Send emails directly to recipient MX servers — no relay, no third-party API. H
 
 - **Builder pattern** — configure once, send many
 - **Bulk sending** — `send_bulk()` with configurable concurrency (default: 5) and per-domain MX caching
-- **DKIM signing** — RSA-SHA256 with `relaxed/relaxed` canonicalization
+- **DKIM signing** — RSA-SHA256 with `relaxed/relaxed` canonicalization and N+1 over-signing (RFC 6376 §5.4 header injection protection)
 - **DKIM key generation** — generate RSA keypairs with ready-to-use DNS TXT records
+- **Manual DKIM implementation** — signs the actual formatted wire bytes (bypasses lettre's broken `Message::sign()`)
 - **Early DKIM validation** — PEM key is parsed and validated at `build()` time, not per-send
 - **IPv4 forcing** — resolve MX to A records only (default: on)
 - **MX fallback** — tries all MX hosts in priority order

@@ -625,6 +625,8 @@ fn mime_from_extension(path: &std::path::Path) -> &'static str {
 }
 
 /// Headers to include in the DKIM signature.
+/// Each is listed twice in the h= tag (N+1 over-signing) to prevent
+/// header injection attacks per RFC 6376 §5.4.
 const DKIM_SIGNED_HEADERS: &[&str] = &[
     "From",
     "To",
@@ -672,10 +674,14 @@ fn dkim_sign_raw(raw: &[u8], dkim: &CachedDkim) -> Vec<u8> {
     let body_hash = Sha256::digest(&canon_body);
     let bh = base64::engine::general_purpose::STANDARD.encode(body_hash);
 
-    // 2. Build the h= tag value
+    // 2. Build the h= tag value with N+1 over-signing:
+    //    each header is listed twice so that injected duplicates break the signature.
     let h_list: String = DKIM_SIGNED_HEADERS
         .iter()
-        .map(|h| h.to_lowercase())
+        .flat_map(|h| {
+            let lower = h.to_lowercase();
+            vec![lower.clone(), lower]
+        })
         .collect::<Vec<_>>()
         .join(":");
 
@@ -692,12 +698,29 @@ fn dkim_sign_raw(raw: &[u8], dkim: &CachedDkim) -> Vec<u8> {
         selector = dkim.selector,
     );
 
-    // 4. Canonicalize the signed headers (from the actual wire format)
+    // 4. Canonicalize the signed headers with N+1 over-signing.
+    //    Per RFC 6376 §5.4, headers are consumed bottom-up. For each name
+    //    in h=, we pick the next unconsumed header with that name. When the
+    //    name appears more times in h= than in the message (the N+1 entry),
+    //    we produce an empty canonicalized line: "headername:\r\n".
     let mut canon_input = String::new();
-    for hname in DKIM_SIGNED_HEADERS {
-        if let Some(full_line) = find_header_in_parsed(&headers, hname) {
-            let canon = relaxed_header_canon(&full_line);
+    let mut used: Vec<bool> = vec![false; headers.len()];
+    for hname in DKIM_SIGNED_HEADERS.iter().flat_map(|h| [*h, *h]) {
+        let lower = hname.to_lowercase();
+        // Walk bottom-up to find the next unconsumed header with this name
+        let found = headers
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(i, (n, _))| !used[*i] && n.to_lowercase() == lower);
+        if let Some((idx, (_, full_line))) = found {
+            used[idx] = true;
+            let canon = relaxed_header_canon(full_line);
             canon_input.push_str(&canon);
+            canon_input.push_str("\r\n");
+        } else {
+            // N+1: header not present → empty canonicalized line
+            canon_input.push_str(&format!("{}:", lower));
             canon_input.push_str("\r\n");
         }
     }
@@ -753,6 +776,7 @@ fn parse_raw_headers(header_block: &str) -> Vec<(String, String)> {
 }
 
 /// Find a header by name (case-insensitive) from parsed headers.
+#[cfg_attr(not(test), allow(dead_code))]
 fn find_header_in_parsed(headers: &[(String, String)], name: &str) -> Option<String> {
     let lower = name.to_lowercase();
     headers
@@ -906,19 +930,28 @@ mod tests {
             return false;
         }
 
-        // Canonicalize signed headers for verification
+        // Canonicalize signed headers for verification (N+1 aware).
+        // Per RFC 6376 §5.4, walk h= entries and consume headers bottom-up.
+        // When a name appears more times in h= than in the message, produce
+        // an empty canonicalized line "headername:\r\n".
         let h_list = tags.get("h").expect("no h tag");
         let header_names: Vec<&str> = h_list.split(':').collect();
         let mut canon_input = String::new();
+        let mut used: Vec<bool> = vec![false; headers.len()];
         for hname in &header_names {
-            // Skip DKIM-Signature itself when looking for the named header
             let lower = hname.to_lowercase();
-            let found = headers
-                .iter()
-                .find(|(n, _)| n.to_lowercase() == lower && n != "DKIM-Signature");
-            if let Some((_, full)) = found {
+            // Walk bottom-up, skip DKIM-Signature and already-used headers
+            let found = headers.iter().enumerate().rev().find(|(i, (n, _))| {
+                !used[*i] && n.to_lowercase() == lower && n != "DKIM-Signature"
+            });
+            if let Some((idx, (_, full))) = found {
+                used[idx] = true;
                 let canon = relaxed_header_canon(full);
                 canon_input.push_str(&canon);
+                canon_input.push_str("\r\n");
+            } else {
+                // N+1: header not present → empty canonicalized line
+                canon_input.push_str(&format!("{}:", lower));
                 canon_input.push_str("\r\n");
             }
         }
@@ -1141,6 +1174,96 @@ mod tests {
         assert!(signed_str.contains("d=test.com"));
         assert!(signed_str.contains("a=rsa-sha256"));
         assert!(signed_str.contains("c=relaxed/relaxed"));
+    }
+
+    #[test]
+    fn dkim_h_tag_has_n_plus_1_over_signing() {
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let email = build_message(
+            "a@example.com",
+            "b@example.com",
+            "hi",
+            "<id@example.com>",
+            Body::text("yo"),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+        let signed_str = String::from_utf8_lossy(&signed);
+
+        // Extract the h= tag and verify each header appears twice
+        let h_start = signed_str.find("h=").expect("no h= tag");
+        let h_end = signed_str[h_start..].find(';').unwrap() + h_start;
+        let h_value = &signed_str[h_start + 2..h_end];
+        let names: Vec<&str> = h_value.split(':').collect();
+        // Each of the 6 signed headers should appear exactly twice
+        for hdr in &[
+            "from",
+            "to",
+            "subject",
+            "date",
+            "message-id",
+            "content-type",
+        ] {
+            let count = names.iter().filter(|n| **n == *hdr).count();
+            assert_eq!(
+                count, 2,
+                "header '{}' should appear 2 times in h= (N+1), found {}",
+                hdr, count
+            );
+        }
+    }
+
+    #[test]
+    fn dkim_n_plus_1_rejects_injected_header() {
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let email = build_message(
+            "a@example.com",
+            "b@example.com",
+            "Test",
+            "<id@example.com>",
+            Body::text("hello"),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+
+        // Verify the unmodified message passes
+        assert!(
+            verify_dkim_signature(&signed, &kp.private_key_pem),
+            "original message should verify"
+        );
+
+        // Now inject a duplicate From header after the DKIM-Signature
+        // (simulating a malicious relay prepending a header)
+        let signed_str = String::from_utf8_lossy(&signed);
+        let dkim_end = signed_str.find("\r\n").unwrap() + 2;
+        let mut tampered = Vec::new();
+        tampered.extend_from_slice(&signed[..dkim_end]);
+        tampered.extend_from_slice(b"From: attacker@evil.com\r\n");
+        tampered.extend_from_slice(&signed[dkim_end..]);
+
+        // The tampered message should FAIL verification because of N+1
+        assert!(
+            !verify_dkim_signature(&tampered, &kp.private_key_pem),
+            "tampered message with injected From should fail DKIM verification due to N+1 over-signing"
+        );
     }
 
     #[test]
