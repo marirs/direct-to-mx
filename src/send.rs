@@ -783,8 +783,7 @@ mod tests {
         let private_key = rsa::RsaPrivateKey::from_pkcs1_pem(pem).unwrap();
         let public_key = rsa::RsaPublicKey::from(&private_key);
         let pub_der = public_key.to_pkcs1_der().unwrap();
-        let pub_b64 =
-            base64::engine::general_purpose::STANDARD.encode(pub_der.as_bytes());
+        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pub_der.as_bytes());
         let dns_txt = format!("v=DKIM1; k=rsa; p={pub_b64}");
 
         let resolver = Resolver::new_system_conf().unwrap();
@@ -989,11 +988,15 @@ mod tests {
         // missing headers also appear (N+1 over-signing)
         for hdr in &["From", "To", "Subject"] {
             let lower = hdr.to_lowercase();
-            let count = names.iter().filter(|n| n.eq_ignore_ascii_case(&lower)).count();
+            let count = names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case(&lower))
+                .count();
             assert!(
                 count >= 1,
                 "header '{}' should appear at least once in h=, found {}",
-                hdr, count
+                hdr,
+                count
             );
         }
     }
@@ -1197,8 +1200,8 @@ mod tests {
             "original raw body must pass DKIM"
         );
 
-        let tampered = String::from_utf8_lossy(&signed)
-            .replace("Original content", "Tampered content");
+        let tampered =
+            String::from_utf8_lossy(&signed).replace("Original content", "Tampered content");
 
         assert!(
             !verify_dkim_with_mail_auth(tampered.as_bytes(), &kp.private_key_pem).await,
@@ -1243,7 +1246,10 @@ mod tests {
         let body_start = formatted_str.find("\r\n\r\n").expect("no header/body sep") + 4;
         let output_body = &formatted_str[body_start..];
 
-        assert_eq!(output_body, input_body, "Body::Raw output must match input exactly");
+        assert_eq!(
+            output_body, input_body,
+            "Body::Raw output must match input exactly"
+        );
     }
 
     #[test]
@@ -1280,7 +1286,10 @@ mod tests {
         let formatted = email.formatted();
         let raw = String::from_utf8_lossy(&formatted);
         assert!(raw.contains("----pgp-test1234"), "boundary must be intact");
-        assert!(raw.contains("BEGIN PGP SIGNATURE"), "signature must be present");
+        assert!(
+            raw.contains("BEGIN PGP SIGNATURE"),
+            "signature must be present"
+        );
     }
 
     #[test]
@@ -1304,7 +1313,10 @@ mod tests {
 
     #[test]
     fn body_raw_with_long_url_no_line_wrap() {
-        let long_url = format!("https://example.com/auth/callback?token={}", "a".repeat(200));
+        let long_url = format!(
+            "https://example.com/auth/callback?token={}",
+            "a".repeat(200)
+        );
         let ct = "text/html; charset=utf-8".to_string();
         let body = format!("<a href=\"{}\">{}</a>", long_url, long_url);
         let email = build_message(
