@@ -1,6 +1,6 @@
 [package]
 name = "direct_to_mx"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Sriram G <marirs@gmail.com>"]
 license = "MIT"
@@ -22,10 +22,12 @@ chrono = "0.4"
 hex = "0.4"
 hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+mail-auth = { version = "0.4", default-features = false, features = ["rust-crypto"] }
 rand = "0.8"
 rsa = { version = "0.9", features = ["pem"] }
 sha2 = { version = "0.10", features = ["oid"] }
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
+mail-auth = { version = "0.4", default-features = false, features = ["rust-crypto", "test"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
