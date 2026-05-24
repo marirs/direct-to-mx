@@ -29,8 +29,14 @@ Send emails directly to recipient MX servers — no relay, no third-party API. H
 
 ```toml
 [dependencies]
-direct_to_mx = "0.1"
+direct_to_mx = "0.3"
 ```
+
+> **0.3.2 dependency refresh.** Bumped `mail-auth` to 0.9, `hickory-resolver` to 0.26,
+> and `rand` to 0.10. The mail-auth bump in particular drops the transitive
+> `zip` / `xz2` / `zstd` chain (~3000 lines of C/asm built via build scripts),
+> shaving roughly 20 seconds off a cold release build. DKIM signing API is
+> unchanged from a consumer's standpoint; only the build is lighter.
 
 ## Quick Start
 

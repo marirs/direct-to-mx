@@ -100,10 +100,15 @@ pub async fn verify_dns(opts: &DnsVerifyOptions) -> Result<DnsVerifyReport, Dire
         return Err(DirectToMxError::Config("domain must not be empty".into()));
     }
 
-    let resolver = hickory_resolver::TokioAsyncResolver::tokio(
+    // hickory-resolver 0.26 replaced the infallible `TokioAsyncResolver::tokio`
+    // constructor with a fallible builder. Building from `Config::default()`
+    // + a default tokio provider does no IO and cannot fail in practice.
+    let resolver = hickory_resolver::TokioResolver::builder_with_config(
         hickory_resolver::config::ResolverConfig::default(),
-        hickory_resolver::config::ResolverOpts::default(),
-    );
+        hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+    )
+    .build()
+    .expect("hickory resolver build from default config cannot fail");
 
     let mut results = Vec::new();
 
@@ -141,17 +146,22 @@ pub async fn verify_dns(opts: &DnsVerifyOptions) -> Result<DnsVerifyReport, Dire
 // Individual checks
 // ---------------------------------------------------------------------------
 
-async fn check_mx(resolver: &hickory_resolver::TokioAsyncResolver, domain: &str) -> DnsCheckResult {
+async fn check_mx(resolver: &hickory_resolver::TokioResolver, domain: &str) -> DnsCheckResult {
+    use hickory_resolver::proto::rr::RData;
     match resolver.mx_lookup(domain).await {
         Ok(mx) => {
+            // hickory 0.26 returns a generic `Lookup`; the typed `MX` iterator
+            // is gone. Walk `.answers()` and pattern-match the RData variant.
             let records: Vec<String> = mx
+                .answers()
                 .iter()
-                .map(|r| {
-                    format!(
+                .filter_map(|rec| match &rec.data {
+                    RData::MX(mx) => Some(format!(
                         "{} {}",
-                        r.preference(),
-                        r.exchange().to_string().trim_end_matches('.')
-                    )
+                        mx.preference,
+                        mx.exchange.to_string().trim_end_matches('.')
+                    )),
+                    _ => None,
                 })
                 .collect();
             if records.is_empty() {
@@ -176,7 +186,7 @@ async fn check_mx(resolver: &hickory_resolver::TokioAsyncResolver, domain: &str)
     }
 }
 
-async fn check_a(resolver: &hickory_resolver::TokioAsyncResolver, domain: &str) -> DnsCheckResult {
+async fn check_a(resolver: &hickory_resolver::TokioResolver, domain: &str) -> DnsCheckResult {
     match resolver.lookup_ip(domain).await {
         Ok(ips) => {
             let addrs: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
@@ -203,7 +213,7 @@ async fn check_a(resolver: &hickory_resolver::TokioAsyncResolver, domain: &str) 
 }
 
 async fn check_ptr(
-    resolver: &hickory_resolver::TokioAsyncResolver,
+    resolver: &hickory_resolver::TokioResolver,
     domain: &str,
     ehlo_hostname: &str,
 ) -> DnsCheckResult {
@@ -230,9 +240,16 @@ async fn check_ptr(
 
     match resolver.reverse_lookup(ip).await {
         Ok(names) => {
+            use hickory_resolver::proto::rr::RData;
+            // hickory 0.26: reverse_lookup returns a generic `Lookup` whose
+            // answers carry `RData::PTR(Name)` records. Pattern-match.
             let ptrs: Vec<String> = names
+                .answers()
                 .iter()
-                .map(|n| n.to_string().trim_end_matches('.').to_string())
+                .filter_map(|rec| match &rec.data {
+                    RData::PTR(ptr) => Some(ptr.0.to_string().trim_end_matches('.').to_string()),
+                    _ => None,
+                })
                 .collect();
             let ok = ptrs.iter().any(|n| n.eq_ignore_ascii_case(ehlo_hostname));
             DnsCheckResult {
@@ -254,12 +271,12 @@ async fn check_ptr(
 }
 
 async fn check_spf(
-    resolver: &hickory_resolver::TokioAsyncResolver,
+    resolver: &hickory_resolver::TokioResolver,
     domain: &str,
 ) -> DnsCheckResult {
     match resolver.txt_lookup(domain).await {
         Ok(txts) => {
-            let records: Vec<String> = txts.iter().map(|r| r.to_string()).collect();
+            let records: Vec<String> = txt_strings(&txts);
             let has_spf = records.iter().any(|t| t.contains("v=spf1"));
             DnsCheckResult {
                 check: DnsCheck::Spf,
@@ -284,7 +301,7 @@ async fn check_spf(
 }
 
 async fn check_dkim(
-    resolver: &hickory_resolver::TokioAsyncResolver,
+    resolver: &hickory_resolver::TokioResolver,
     domain: &str,
     selector: Option<&str>,
     expected_pub_b64: Option<&str>,
@@ -303,7 +320,7 @@ async fn check_dkim(
     let dkim_domain = format!("{selector}._domainkey.{domain}");
     match resolver.txt_lookup(&dkim_domain).await {
         Ok(txts) => {
-            let records: Vec<String> = txts.iter().map(|r| r.to_string()).collect();
+            let records: Vec<String> = txt_strings(&txts);
             let has_dkim = records
                 .iter()
                 .any(|t| t.contains("v=DKIM1") && t.contains("p="));
@@ -354,13 +371,13 @@ async fn check_dkim(
 }
 
 async fn check_dmarc(
-    resolver: &hickory_resolver::TokioAsyncResolver,
+    resolver: &hickory_resolver::TokioResolver,
     domain: &str,
 ) -> DnsCheckResult {
     let dmarc_domain = format!("_dmarc.{domain}");
     match resolver.txt_lookup(&dmarc_domain).await {
         Ok(txts) => {
-            let records: Vec<String> = txts.iter().map(|r| r.to_string()).collect();
+            let records: Vec<String> = txt_strings(&txts);
             let has_dmarc = records.iter().any(|t| t.contains("v=DMARC1"));
 
             if !has_dmarc {
@@ -393,4 +410,21 @@ async fn check_dmarc(
             detail: format!("error looking up {dmarc_domain}: {e}"),
         },
     }
+}
+
+/// Extract TXT record strings from a generic `Lookup` (hickory 0.26).
+/// Pre-0.26 a `TxtLookup` had a typed `.iter()` returning `&TXT`; the
+/// new generic `Lookup` only exposes `&[Record]`, so we filter for
+/// `RData::TXT` variants and convert each to a `String` via its
+/// `Display` impl.
+fn txt_strings(lookup: &hickory_resolver::lookup::Lookup) -> Vec<String> {
+    use hickory_resolver::proto::rr::RData;
+    lookup
+        .answers()
+        .iter()
+        .filter_map(|rec| match &rec.data {
+            RData::TXT(txt) => Some(txt.to_string()),
+            _ => None,
+        })
+        .collect()
 }

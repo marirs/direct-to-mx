@@ -725,18 +725,34 @@ fn dkim_sign_raw(raw: &[u8], dkim: &CachedDkim) -> Vec<u8> {
 /// Resolve MX hosts for a domain, sorted by preference (lowest = highest
 /// priority). Falls back to the domain itself if no MX records exist.
 async fn resolve_mx(domain: &str) -> Vec<String> {
-    let resolver = hickory_resolver::TokioAsyncResolver::tokio(
+    use hickory_resolver::proto::rr::RData;
+
+    // hickory 0.26 replaced the infallible `TokioAsyncResolver::tokio`
+    // constructor with a fallible builder. Defaults do no IO so the
+    // build cannot realistically fail.
+    let resolver = hickory_resolver::TokioResolver::builder_with_config(
         hickory_resolver::config::ResolverConfig::default(),
-        hickory_resolver::config::ResolverOpts::default(),
-    );
+        hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+    )
+    .build()
+    .expect("hickory resolver build from default config cannot fail");
 
     match resolver.mx_lookup(domain).await {
         Ok(mx) => {
-            let mut records: Vec<_> = mx.iter().collect();
-            records.sort_by_key(|r| r.preference());
+            // 0.26's `Lookup` is generic — walk `.answers()` and match the
+            // RData::MX variant to get the typed preference + exchange.
+            let mut records: Vec<&hickory_resolver::proto::rr::rdata::MX> = mx
+                .answers()
+                .iter()
+                .filter_map(|rec| match &rec.data {
+                    RData::MX(m) => Some(m),
+                    _ => None,
+                })
+                .collect();
+            records.sort_by_key(|r| r.preference);
             let hosts: Vec<String> = records
                 .iter()
-                .map(|r| r.exchange().to_string().trim_end_matches('.').to_string())
+                .map(|r| r.exchange.to_string().trim_end_matches('.').to_string())
                 .filter(|h| !h.is_empty())
                 .collect();
             if hosts.is_empty() {
@@ -752,17 +768,26 @@ async fn resolve_mx(domain: &str) -> Vec<String> {
 /// Resolve a hostname to its first IPv4 address. Falls back to the hostname
 /// itself if no A record is found.
 async fn resolve_ipv4(host: &str) -> String {
-    let resolver = hickory_resolver::TokioAsyncResolver::tokio(
+    use hickory_resolver::proto::rr::RData;
+
+    let resolver = hickory_resolver::TokioResolver::builder_with_config(
         hickory_resolver::config::ResolverConfig::default(),
-        hickory_resolver::config::ResolverOpts::default(),
-    );
+        hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+    )
+    .build()
+    .expect("hickory resolver build from default config cannot fail");
 
     match resolver.ipv4_lookup(host).await {
         Ok(lookup) => {
-            if let Some(addr) = lookup.iter().next() {
-                addr.to_string()
-            } else {
-                host.to_string()
+            // hickory 0.26: ipv4_lookup returns a generic `Lookup` with
+            // RData::A records. Grab the first one's inner Ipv4Addr.
+            let first = lookup.answers().iter().find_map(|rec| match &rec.data {
+                RData::A(a) => Some(a.0),
+                _ => None,
+            });
+            match first {
+                Some(addr) => addr.to_string(),
+                None => host.to_string(),
             }
         }
         Err(_) => host.to_string(),
@@ -788,19 +813,8 @@ mod tests {
     /// message: starts with `DKIM-Signature:`, contains the canonical
     /// tags (`v=1`, `a=rsa-sha256`, `c=relaxed/relaxed`, `d=`, `s=`,
     /// `bh=`, `b=`), and the `bh=` and `b=` values are non-empty
-    /// base64.
-    ///
-    /// HISTORY: this helper replaces a previous `verify_dkim_with_mail_auth`
-    /// helper that ran the signed message through `mail_auth::Resolver`'s
-    /// verifier with a mocked DNS TXT record. mail-auth 0.9 moved that
-    /// type to `MessageAuthenticator` and made the test-only `DummyCaches`
-    /// `pub(crate)`, so the helper can no longer reach into mail-auth's
-    /// mocked-DNS path from external code. End-to-end DKIM correctness
-    /// is verified at email-receive time by Gmail/Outlook/etc., not by
-    /// this test. If we ever need cryptographic verification back in
-    /// these tests, the path forward is implementing a tiny custom
-    /// `ResolverCache` impl over `MessageAuthenticator::verify_dkim` —
-    /// ~60 lines and self-contained.
+    /// base64. Cryptographic correctness is covered by the separate
+    /// `verify_dkim_with_mail_auth` helper.
     fn assert_signed_structurally(signed_raw: &[u8]) {
         let signed = String::from_utf8_lossy(signed_raw);
         let unfolded = signed.replace("\r\n\t", " ").replace("\r\n ", " ");
@@ -856,8 +870,128 @@ mod tests {
         after[..end].trim().to_string()
     }
 
-    #[test]
-    fn dkim_sign_html_only_produces_signed_output() {
+    // ────────────────────────────────────────────────────────────────────
+    // Cryptographic DKIM verification helper
+    // ────────────────────────────────────────────────────────────────────
+    //
+    // mail-auth 0.9 dropped the unified `Resolver` type (DNS + DKIM verify
+    // in one) in favour of `MessageAuthenticator` + the `ResolverCache<K, V>`
+    // trait. To verify a DKIM signature against a mocked DNS TXT record
+    // (the public key) without making a real DNS query, we need to:
+    //
+    //   1. Implement `ResolverCache<Box<str>, mail_auth::Txt>` over a
+    //      simple `HashMap<Box<str>, Txt>`.
+    //   2. Pre-populate it with the DKIM selector's public-key TXT
+    //      (`v=DKIM1; k=rsa; p=<base64>`), parsed via `DomainKey::parse`
+    //      and wrapped as `Txt::DomainKey(Arc::new(_))`.
+    //   3. Wire the cache into a `Parameters` via `.with_txt_cache` and
+    //      pass that to `MessageAuthenticator::verify_dkim`.
+    //
+    // This restores the exact assertion the pre-0.9 tests made — that the
+    // DKIM signature produced by our signer is cryptographically valid
+    // when verified by mail-auth (the same library production mail servers
+    // like Stalwart use to validate incoming DKIM).
+
+    /// Minimal in-memory `ResolverCache` for TXT lookups. Test-only.
+    /// `NoCache` (mail-auth's default-fill) takes the other 4 slots
+    /// (MX/PTR/IPV4/IPV6) which DKIM verification doesn't consult.
+    struct TestTxtCache {
+        inner: std::sync::Mutex<std::collections::HashMap<Box<str>, mail_auth::Txt>>,
+    }
+
+    impl TestTxtCache {
+        fn new() -> Self {
+            Self {
+                inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl mail_auth::ResolverCache<Box<str>, mail_auth::Txt> for TestTxtCache {
+        fn get<Q>(&self, key: &Q) -> Option<mail_auth::Txt>
+        where
+            Box<str>: std::borrow::Borrow<Q>,
+            Q: std::hash::Hash + Eq + ?Sized,
+        {
+            self.inner.lock().unwrap().get(key).cloned()
+        }
+
+        fn remove<Q>(&self, key: &Q) -> Option<mail_auth::Txt>
+        where
+            Box<str>: std::borrow::Borrow<Q>,
+            Q: std::hash::Hash + Eq + ?Sized,
+        {
+            self.inner.lock().unwrap().remove(key)
+        }
+
+        fn insert(&self, key: Box<str>, value: mail_auth::Txt, _valid_until: std::time::Instant) {
+            self.inner.lock().unwrap().insert(key, value);
+        }
+    }
+
+    /// Verify a DKIM-signed message cryptographically using mail-auth's
+    /// own verifier with the public-key DNS record mocked in-memory.
+    /// Returns `true` if the signature passes, `false` for any other
+    /// outcome (Fail, TempError, PermError, ...).
+    ///
+    /// The signed message must contain a DKIM-Signature header with the
+    /// usual `s=` selector and `d=` domain tags so the verifier can look
+    /// up the public key by `<selector>._domainkey.<domain>.`.
+    async fn verify_dkim_with_mail_auth(signed_raw: &[u8], pem: &str) -> bool {
+        use base64::Engine;
+        use mail_auth::common::parse::TxtRecordParser;
+        use mail_auth::common::verify::DomainKey;
+        use mail_auth::{AuthenticatedMessage, DkimResult, MessageAuthenticator, Parameters, Txt};
+        use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPublicKey};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        // 1. Derive public key DNS TXT from the private PEM.
+        let private_key = rsa::RsaPrivateKey::from_pkcs1_pem(pem).unwrap();
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let pub_der = public_key.to_pkcs1_der().unwrap();
+        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pub_der.as_bytes());
+        let dns_txt = format!("v=DKIM1; k=rsa; p={pub_b64}");
+
+        // 2. Extract selector + domain from the DKIM-Signature header so
+        //    we know what name to insert the mocked TXT under.
+        let raw_str = String::from_utf8_lossy(signed_raw);
+        let unfolded = raw_str.replace("\r\n\t", " ").replace("\r\n ", " ");
+        let selector = extract_tag(&unfolded, "s=");
+        let domain = extract_tag(&unfolded, "d=");
+        let dns_name = format!("{selector}._domainkey.{domain}.");
+
+        // 3. Build the TXT cache and seed the public key under the FQDN.
+        let cache = TestTxtCache::new();
+        let domain_key = DomainKey::parse(dns_txt.as_bytes()).unwrap();
+        cache.inner.lock().unwrap().insert(
+            dns_name.into_boxed_str(),
+            Txt::DomainKey(Arc::new(domain_key)),
+        );
+        let _ = Instant::now() + Duration::from_secs(3600); // (TTL is ignored by our cache)
+
+        // 4. Parse the message and run mail-auth's verifier through a
+        //    `MessageAuthenticator`. We need a `TokioResolver` to build
+        //    one even though our cache short-circuits actual DNS calls.
+        let authenticator = MessageAuthenticator(
+            hickory_resolver::TokioResolver::builder_with_config(
+                hickory_resolver::config::ResolverConfig::default(),
+                hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+            )
+            .build()
+            .expect("test resolver build"),
+        );
+        let message = AuthenticatedMessage::parse(signed_raw).unwrap();
+        let params = Parameters::new(&message).with_txt_cache(&cache);
+        let dkim = authenticator.verify_dkim(params).await;
+
+        // mail-auth returns one `DkimOutput` per DKIM-Signature header.
+        // We sign exactly one, so the last (and only) result is decisive.
+        matches!(dkim.last().map(|o| o.result()), Some(DkimResult::Pass))
+    }
+
+    #[tokio::test]
+    async fn dkim_sign_and_verify_html_only() {
         let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
         let dkim = CachedDkim {
             selector: "sel1".into(),
@@ -878,10 +1012,14 @@ mod tests {
         let raw = email.formatted();
         let signed = dkim_sign_raw(&raw, &dkim);
         assert_signed_structurally(&signed);
+        assert!(
+            verify_dkim_with_mail_auth(&signed, &kp.private_key_pem).await,
+            "DKIM verification failed for HTML-only email"
+        );
     }
 
-    #[test]
-    fn dkim_sign_multipart_produces_signed_output() {
+    #[tokio::test]
+    async fn dkim_sign_and_verify_multipart() {
         let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
         let dkim = CachedDkim {
             selector: "sel1".into(),
@@ -902,10 +1040,14 @@ mod tests {
         let raw = email.formatted();
         let signed = dkim_sign_raw(&raw, &dkim);
         assert_signed_structurally(&signed);
+        assert!(
+            verify_dkim_with_mail_auth(&signed, &kp.private_key_pem).await,
+            "DKIM verification failed for multipart email"
+        );
     }
 
-    #[test]
-    fn dkim_sign_text_only_produces_signed_output() {
+    #[tokio::test]
+    async fn dkim_sign_and_verify_text_only() {
         let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
         let dkim = CachedDkim {
             selector: "sel1".into(),
@@ -926,10 +1068,14 @@ mod tests {
         let raw = email.formatted();
         let signed = dkim_sign_raw(&raw, &dkim);
         assert_signed_structurally(&signed);
+        assert!(
+            verify_dkim_with_mail_auth(&signed, &kp.private_key_pem).await,
+            "DKIM verification failed for text-only email"
+        );
     }
 
-    #[test]
-    fn dkim_sign_with_attachment_produces_signed_output() {
+    #[tokio::test]
+    async fn dkim_sign_and_verify_with_attachment() {
         let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
         let dkim = CachedDkim {
             selector: "sel1".into(),
@@ -951,6 +1097,10 @@ mod tests {
         let raw = email.formatted();
         let signed = dkim_sign_raw(&raw, &dkim);
         assert_signed_structurally(&signed);
+        assert!(
+            verify_dkim_with_mail_auth(&signed, &kp.private_key_pem).await,
+            "DKIM verification failed for email with attachment"
+        );
     }
 
     #[test]
@@ -1029,17 +1179,62 @@ mod tests {
         }
     }
 
-    // TAMPER / N+1 tests deferred: these tests need full cryptographic
-    // DKIM verification to prove that modifying a signed message breaks
-    // the signature. mail-auth 0.9 made `DummyCaches` `pub(crate)`, so
-    // the previous in-test mocked-DNS verifier no longer compiles
-    // against external code. Restoring these requires a small custom
-    // `ResolverCache` impl over `MessageAuthenticator::verify_dkim`
-    // (~60 lines); tracked as follow-up.
-    #[cfg(any())]
+    /// DKIM should bind the From header; injecting a duplicate From
+    /// after signing must invalidate the signature (the N+1 attack).
+    /// Uses the cryptographic verifier from `verify_dkim_with_mail_auth`.
     #[tokio::test]
     async fn dkim_n_plus_1_rejects_injected_header() {
-        // (original body kept under cfg(any()) for the restoration patch)
+        let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
+        let dkim = CachedDkim {
+            selector: "sel1".into(),
+            domain: "example.com".into(),
+            private_key_pem: kp.private_key_pem.clone(),
+        };
+
+        let email = build_message(
+            "a@example.com",
+            "b@example.com",
+            "Test",
+            "<id@example.com>",
+            Body::text("hello"),
+            &[],
+        )
+        .unwrap();
+
+        let raw = email.formatted();
+        let signed = dkim_sign_raw(&raw, &dkim);
+
+        // Sanity: original message verifies.
+        assert!(
+            verify_dkim_with_mail_auth(&signed, &kp.private_key_pem).await,
+            "original message should verify"
+        );
+
+        // Inject a duplicate From header AFTER the folded DKIM-Signature.
+        let signed_str = String::from_utf8_lossy(&signed);
+        let mut dkim_end = 0;
+        let mut first = true;
+        for line in signed_str.split("\r\n") {
+            if first {
+                first = false;
+                dkim_end += line.len() + 2;
+                continue;
+            }
+            if line.starts_with('\t') || line.starts_with(' ') {
+                dkim_end += line.len() + 2;
+            } else {
+                break;
+            }
+        }
+        let mut tampered = Vec::new();
+        tampered.extend_from_slice(&signed[..dkim_end]);
+        tampered.extend_from_slice(b"From: attacker@evil.com\r\n");
+        tampered.extend_from_slice(&signed[dkim_end..]);
+
+        assert!(
+            !verify_dkim_with_mail_auth(&tampered, &kp.private_key_pem).await,
+            "tampered message with injected From should fail DKIM"
+        );
     }
 
     #[test]
@@ -1059,8 +1254,8 @@ mod tests {
         assert!(!raw_str.contains("DKIM-Signature"));
     }
 
-    #[test]
-    fn dkim_sign_body_raw_simple_produces_signed_output() {
+    #[tokio::test]
+    async fn dkim_sign_and_verify_body_raw_simple() {
         let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
         let dkim = CachedDkim {
             selector: "sel1".into(),
@@ -1084,10 +1279,14 @@ mod tests {
         let raw = email.formatted();
         let signed = dkim_sign_raw(&raw, &dkim);
         assert_signed_structurally(&signed);
+        assert!(
+            verify_dkim_with_mail_auth(&signed, &kp.private_key_pem).await,
+            "DKIM verification failed for Body::Raw simple email"
+        );
     }
 
-    #[test]
-    fn dkim_sign_body_raw_pgp_mime_produces_signed_output() {
+    #[tokio::test]
+    async fn dkim_sign_and_verify_body_raw_pgp_mime() {
         let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();
         let dkim = CachedDkim {
             selector: "sel1".into(),
@@ -1139,6 +1338,10 @@ mod tests {
         let raw = email.formatted();
         let signed = dkim_sign_raw(&raw, &dkim);
         assert_signed_structurally(&signed);
+        assert!(
+            verify_dkim_with_mail_auth(&signed, &kp.private_key_pem).await,
+            "DKIM verification failed for PGP/MIME multipart/signed email"
+        );
 
         let signed_str = String::from_utf8_lossy(&signed);
         // Body must be preserved verbatim through the DKIM-signing path
@@ -1149,10 +1352,9 @@ mod tests {
         assert!(signed_str.contains(boundary));
     }
 
-    // See note above: tamper-detection tests need cryptographic
-    // verification; deferred until a small custom `ResolverCache` impl
-    // restores the mocked-DNS verify path against mail-auth 0.9.
-    #[cfg(any())]
+    /// Body bytes must be canonicalised into the signature. Editing the
+    /// signed message's body (even just text substitution) must break
+    /// verification. Uses the cryptographic verifier.
     #[tokio::test]
     async fn dkim_body_raw_tamper_detected() {
         let kp = crate::generate_dkim_keypair("sel1", "example.com", Some(2048)).unwrap();

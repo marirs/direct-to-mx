@@ -1,6 +1,6 @@
 [package]
 name = "direct_to_mx"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 authors = ["Sriram G <marirs@gmail.com>"]
 license = "MIT"
@@ -20,12 +20,11 @@ path = "src/lib.rs"
 base64 = "0.22"
 chrono = "0.4"
 hex = "0.4"
-hickory-resolver = { version = "0.24", features = ["tokio-runtime"] }
+hickory-resolver = "0.26"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 mail-auth = { version = "0.9", default-features = false, features = ["ring", "rsa"] }
 rand = "0.10"
 rsa = { version = "0.9", features = ["pem"] }
-sha2 = { version = "0.10", features = ["oid"] }
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
