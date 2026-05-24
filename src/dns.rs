@@ -270,10 +270,7 @@ async fn check_ptr(
     }
 }
 
-async fn check_spf(
-    resolver: &hickory_resolver::TokioResolver,
-    domain: &str,
-) -> DnsCheckResult {
+async fn check_spf(resolver: &hickory_resolver::TokioResolver, domain: &str) -> DnsCheckResult {
     match resolver.txt_lookup(domain).await {
         Ok(txts) => {
             let records: Vec<String> = txt_strings(&txts);
@@ -370,10 +367,7 @@ async fn check_dkim(
     }
 }
 
-async fn check_dmarc(
-    resolver: &hickory_resolver::TokioResolver,
-    domain: &str,
-) -> DnsCheckResult {
+async fn check_dmarc(resolver: &hickory_resolver::TokioResolver, domain: &str) -> DnsCheckResult {
     let dmarc_domain = format!("_dmarc.{domain}");
     match resolver.txt_lookup(&dmarc_domain).await {
         Ok(txts) => {
