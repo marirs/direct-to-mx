@@ -809,7 +809,15 @@ mod tests {
             signed.starts_with("DKIM-Signature:"),
             "DKIM-Signature header missing"
         );
-        for tag in ["v=1", "a=rsa-sha256", "c=relaxed/relaxed", "d=", "s=", "bh=", "b="] {
+        for tag in [
+            "v=1",
+            "a=rsa-sha256",
+            "c=relaxed/relaxed",
+            "d=",
+            "s=",
+            "bh=",
+            "b=",
+        ] {
             assert!(
                 unfolded.contains(tag),
                 "DKIM-Signature missing tag {tag}: {unfolded}"
@@ -840,7 +848,9 @@ mod tests {
     /// Pull the value of a `name=` tag (up to the next `;` or end of string)
     /// from an unfolded DKIM-Signature header value. Returns trimmed text.
     fn extract_tag(unfolded: &str, name: &str) -> String {
-        let Some(start) = unfolded.find(name) else { return String::new() };
+        let Some(start) = unfolded.find(name) else {
+            return String::new();
+        };
         let after = &unfolded[start + name.len()..];
         let end = after.find(';').unwrap_or(after.len());
         after[..end].trim().to_string()
